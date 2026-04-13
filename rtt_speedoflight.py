@@ -69,15 +69,34 @@ def measure_rtt(url: str, probes: int = PROBES) -> dict:
     lost    = 0
 
     for _ in range(probes):
-        # TODO: send probe
+        try:
+            # perf_counter gives sub-millisecond resolution — always use it
+            # instead of time.time() for elapsed measurements.
+            start = time.perf_counter()
+            urllib.request.urlopen(url, timeout=3)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            samples.append(elapsed_ms)
+        except Exception:
+            # Timeouts, connection refused, DNS failures all count as lost.
+            lost += 1
+
+        # Brief pause prevents hammering the target and keeps results stable.
         time.sleep(0.2)
 
     if not samples:
-        return {"min_ms": None, "mean_ms": None, "median_ms": None,
-                "loss_pct": 100.0, "samples": []}
+        return {
+            "min_ms": None, "mean_ms": None, "median_ms": None,
+            "loss_pct": 100.0, "samples": []
+        }
 
-    # TODO: compute and return stats
-    return {}  # placeholder
+    arr = np.array(samples)
+    return {
+        "min_ms":    float(np.min(arr)),
+        "mean_ms":   float(np.mean(arr)),
+        "median_ms": float(np.median(arr)),
+        "loss_pct":  (lost / probes) * 100,
+        "samples":   samples,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -96,9 +115,22 @@ def great_circle_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     TODO: implement from scratch. Use math.radians() to convert degrees.
     Do NOT use geopy or any distance library.
     """
-    R = 6371
-    # TODO
-    return 0.0  # placeholder
+
+    R = 6371  # Earth's mean radius in km
+
+    # Convert degrees → radians (trig functions in Python always want radians)
+    phi1    = math.radians(lat1)
+    phi2    = math.radians(lat2)
+    dphi    = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+
+    a = (math.sin(dphi / 2) ** 2
+         + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2)
+
+    # atan2 is numerically stable even for antipodal points (opposite sides of Earth)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    return R * c
 
 
 def get_my_location() -> tuple[float, float, str]:
@@ -110,6 +142,7 @@ def get_my_location() -> tuple[float, float, str]:
     except Exception:
         print("Could not auto-detect location. Defaulting to Boston.")
         return 42.3601, -71.0589, "Boston"
+
 
 
 def compute_inefficiency(results: dict, src_lat: float, src_lon: float) -> dict:
@@ -127,8 +160,21 @@ def compute_inefficiency(results: dict, src_lat: float, src_lon: float) -> dict:
         4. Annotate results[city] in place.
     """
     for city, data in results.items():
-        # TODO
-        pass
+        city_lat, city_lon = data["coords"]
+        dist_km = great_circle_km(src_lat, src_lon, city_lat, city_lon)
+        theoretical_min_ms = (dist_km / FIBER_SPEED_KM_S) * 2 * 1000
+
+        median_ms = data.get("median_ms")
+        if median_ms is not None and theoretical_min_ms > 0:
+            ratio = median_ms / theoretical_min_ms
+        else:
+            ratio = None
+
+        data["distance_km"]       = dist_km
+        data["theoretical_min_ms"] = theoretical_min_ms
+        data["inefficiency_ratio"] = ratio
+        data["high_inefficiency"]  = (ratio is not None and ratio > 3.0)
+
     return results
 
 
@@ -164,21 +210,91 @@ def make_plots(results: dict):
     valid  = {c: d for c, d in results.items() if d.get("median_ms") is not None}
     cities = sorted(valid, key=lambda c: valid[c]["distance_km"])
 
-    # ── Figure 1 ──────────────────────────────
+    # ── Figure 1: Grouped Bar Chart ───────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(11, 6))
-    # TODO
+
+    x          = np.arange(len(cities))
+    bar_width  = 0.35
+
+    medians    = [valid[c]["median_ms"]        for c in cities]
+    theoretics = [valid[c]["theoretical_min_ms"] for c in cities]
+
+    bars1 = ax.bar(x - bar_width / 2, medians,    bar_width, label="Measured Median RTT",    color="#457b9d", alpha=0.9)
+    bars2 = ax.bar(x + bar_width / 2, theoretics, bar_width, label="Theoretical Minimum RTT", color="#a8dadc", alpha=0.9, edgecolor="#457b9d", linewidth=0.8)
+
+    # Add value labels on top of each bar for readability
+    for bar in bars1:
+        h = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width() / 2, h + 1.5, f"{h:.0f}", ha="center", va="bottom", fontsize=8)
+    for bar in bars2:
+        h = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width() / 2, h + 1.5, f"{h:.0f}", ha="center", va="bottom", fontsize=8, color="#457b9d")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(cities, rotation=20, ha="right", fontsize=10)
+    ax.set_ylabel("RTT (ms)", fontsize=11)
+    ax.set_xlabel("City (sorted by great-circle distance)", fontsize=11)
+    ax.set_title("Measured RTT vs. Theoretical Minimum (Speed-of-Light in Fiber)", fontsize=13, fontweight="bold")
+    ax.legend(fontsize=10)
+    ax.set_ylim(0, max(medians) * 1.2)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+
     plt.tight_layout()
     plt.savefig(f"{FIGURES_DIR}/fig1_rtt_comparison.png", dpi=150, bbox_inches="tight")
     plt.close()
+    print(f"  Saved {FIGURES_DIR}/fig1_rtt_comparison.png")
 
-    # ── Figure 2 ──────────────────────────────
+    # ── Figure 2: Scatter Plot ────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(10, 7))
-    # TODO
+
+    # Draw the theoretical minimum dashed line
+    # We extend it a bit past the furthest city for visual clarity
+    max_dist = max(valid[c]["distance_km"] for c in cities)
+    line_x   = np.linspace(0, max_dist * 1.05, 300)
+    line_y   = (line_x / FIBER_SPEED_KM_S) * 2 * 1000
+    ax.plot(line_x, line_y, "--", color="gray", linewidth=1.5,
+            label="Theoretical minimum (fiber @ 200,000 km/s)", zorder=1)
+
+    # Plot each city colored by continent
+    plotted_continents = set()
+    for city in cities:
+        d         = valid[city]
+        continent = d["continent"]
+        color     = CONTINENT_COLORS.get(continent, "#888888")
+        ax.scatter(d["distance_km"], d["median_ms"],
+                   color=color, s=90, zorder=3,
+                   label=continent if continent not in plotted_continents else "")
+        plotted_continents.add(continent)
+
+        # Offset city labels slightly so they don't overlap the dot
+        ax.annotate(
+            city,
+            xy=(d["distance_km"], d["median_ms"]),
+            xytext=(8, 4),
+            textcoords="offset points",
+            fontsize=8.5,
+        )
+
+    ax.set_xlabel("Great-Circle Distance (km)", fontsize=11)
+    ax.set_ylabel("Measured Median RTT (ms)", fontsize=11)
+    ax.set_title("RTT vs. Great-Circle Distance\n(dashed = theoretical minimum, colors = continent)", fontsize=12, fontweight="bold")
+    ax.grid(linestyle="--", alpha=0.35)
+
+    # Build a clean continent legend (deduplicated)
+    legend_patches = [
+        mpatches.Patch(color=CONTINENT_COLORS[cont], label=cont)
+        for cont in CONTINENT_COLORS
+        if cont in {valid[c]["continent"] for c in cities}
+    ]
+    legend_patches.append(
+        plt.Line2D([0], [0], linestyle="--", color="gray", label="Theoretical min")
+    )
+    ax.legend(handles=legend_patches, fontsize=9, loc="upper left")
+
     plt.tight_layout()
     plt.savefig(f"{FIGURES_DIR}/fig2_distance_scatter.png", dpi=150, bbox_inches="tight")
     plt.close()
-
-    print(f"Figures saved to {FIGURES_DIR}/")
+    print(f"  Saved {FIGURES_DIR}/fig2_distance_scatter.png")
 
 
 # ─────────────────────────────────────────────
